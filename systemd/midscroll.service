@@ -1,8 +1,12 @@
 [Unit]
 Description=midscroll - Windows-style middle-drag autoscroll
+# uinput is normally autoloaded; where it isn't, let systemd load it rather
+# than running modprobe ourselves, so this service can drop every capability
+# and forbid module loading outright (see CapabilityBoundingSet below).
+Wants=modprobe@uinput.service
+After=modprobe@uinput.service
 
 [Service]
-ExecStartPre=-/usr/sbin/modprobe uinput
 ExecStart=/usr/bin/python3 /usr/bin/midscroll
 # Holds the state socket the session overlay (midscroll-overlay) listens on
 RuntimeDirectory=midscroll
@@ -17,16 +21,25 @@ CPUSchedulingPriority=20
 # /sys writable, and RuntimeDirectory= is implicitly writable, so the
 # socket and devices keep working. Deliberately absent because they would
 # break the daemon: PrivateDevices/DevicePolicy (needs real evdev+uinput
-# nodes, including ones hotplugged later), ProtectKernelModules (the
-# ExecStartPre modprobe), RestrictRealtime (FIFO scheduling above).
+# nodes, including ones hotplugged later), RestrictRealtime (FIFO
+# scheduling above), PrivateUsers (the device nodes are root's).
 NoNewPrivileges=yes
+# It runs as root for the device nodes, but wants no capability at all:
+# opening /dev/input and /dev/uinput, EVIOCGRAB and uinput ioctls are all
+# plain DAC, and the FIFO priority above is set by PID 1 before exec.
+CapabilityBoundingSet=
+AmbientCapabilities=
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 PrivateNetwork=yes
+IPAddressDeny=any
 RestrictAddressFamilies=AF_UNIX
+ProtectProc=invisible
+ProcSubset=pid
 ProtectKernelTunables=yes
 ProtectKernelLogs=yes
+ProtectKernelModules=yes
 ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
@@ -34,6 +47,11 @@ RestrictNamespaces=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 SystemCallArchitectures=native
+UMask=0077
+# Containment for the state socket, which every logged-in user can reach:
+# the daemon caps clients itself, and these cap what a bug could cost.
+MemoryMax=128M
+TasksMax=32
 # Allow only the service syscall set and fail the rest with EPERM rather
 # than SIGSYS. @system-service already excludes @resources, @privileged,
 # @module, @mount and friends, and still includes ioctl (EVIOCGRAB + uinput)

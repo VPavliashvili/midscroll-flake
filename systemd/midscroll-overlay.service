@@ -1,5 +1,5 @@
 [Unit]
-Description=midscroll session helper - scroll badge and focus reporting
+Description=midscroll session helper - autoscroll cursor and focus reporting
 After=graphical-session.target
 PartOf=graphical-session.target
 
@@ -16,19 +16,35 @@ RestartSec=2
 # /tmp - 'strict' makes /tmp read-only and a private /tmp is invisible to
 # KWin, and either one silently breaks the scroll badge and focus reporting.
 # Also deliberately absent: MemoryDenyWriteExecute (GTK + GL/Vulkan map
-# writable-executable pages) and tighter address families (keep AF_UNIX for
-# Wayland/X and the session bus, AF_NETLINK for device and GL enumeration).
+# writable-executable pages), ProtectProc/ProcSubset (GL and kdotool poke
+# around /proc), ProtectHome (this runs as you, so locking it out of your
+# home buys nothing an attacker couldn't undo by starting another process,
+# and it breaks the font and shader caches) and tighter address families
+# (keep AF_UNIX for Wayland/X and the session bus, AF_NETLINK for device
+# and GL enumeration).
 NoNewPrivileges=yes
+# A session GUI needs no capability whatsoever.
+CapabilityBoundingSet=
+AmbientCapabilities=
 ProtectSystem=full
 ProtectKernelTunables=yes
 ProtectKernelLogs=yes
+ProtectKernelModules=yes
 ProtectControlGroups=yes
 ProtectClock=yes
+ProtectHostname=yes
 RestrictNamespaces=yes
 RestrictSUIDSGID=yes
+RestrictRealtime=yes
 LockPersonality=yes
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_NETLINK
+UMask=0077
+TasksMax=64
+# Draws only; the syscall set a normal service gets is plenty. EPERM rather
+# than SIGSYS so an unexpected call degrades instead of killing the badge.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=graphical-session.target

@@ -1,5 +1,5 @@
 Name:           midscroll
-Version:        1.12
+Version:        1.13
 Release:        1%{?dist}
 Summary:        Windows-style middle-button drag autoscroll
 License:        Unlicense
@@ -17,6 +17,7 @@ Source8:        midscroll-settings.py
 Source9:        midscroll-apply.py
 Source10:       io.github.gnhen.midscroll.Settings.desktop
 Source11:       io.github.gnhen.midscroll.policy
+Source12:       SECURITY.md
 
 Requires:       python3
 Requires:       python3-evdev
@@ -38,14 +39,17 @@ BuildRequires:  systemd-rpm-macros
 Hold the middle mouse button and drag to scroll, with speed proportional
 to drag distance, like Windows 10/11. Works on Wayland and X11 in every
 application by operating at the kernel input layer (evdev/uinput).
-Includes a session overlay that shows a scroll badge at the anchored
-cursor while a drag-scroll is active, and a GTK settings GUI.
+Includes a session overlay that draws the autoscroll badge at the
+anchored pointer and a ghost cursor that follows your hand while a
+drag-scroll is active, and a GTK settings GUI that also picks which
+devices count as a mouse.
 
 %install
 install -Dm755 %{SOURCE0} %{buildroot}%{_bindir}/midscroll
 install -Dm644 %{SOURCE1} %{buildroot}%{_unitdir}/midscroll.service
 install -Dm644 %{SOURCE2} %{buildroot}%{_sysconfdir}/midscroll.conf
 install -Dm644 %{SOURCE3} %{buildroot}%{_docdir}/midscroll/README.md
+install -Dm644 %{SOURCE12} %{buildroot}%{_docdir}/midscroll/SECURITY.md
 install -Dm755 %{SOURCE4} %{buildroot}%{_bindir}/midscroll-overlay
 install -Dm644 %{SOURCE5} %{buildroot}%{_userunitdir}/midscroll-overlay.service
 install -Dm644 %{SOURCE6} %{buildroot}%{_datadir}/midscroll/move-vertical.svg
@@ -82,6 +86,7 @@ fi
 %files
 %license %{_licensedir}/midscroll/LICENSE
 %doc %{_docdir}/midscroll/README.md
+%doc %{_docdir}/midscroll/SECURITY.md
 %{_bindir}/midscroll
 %{_bindir}/midscroll-overlay
 %{_bindir}/midscroll-settings
@@ -96,6 +101,19 @@ fi
 %config(noreplace) %{_sysconfdir}/midscroll.conf
 
 %changelog
+* Mon Jul 27 2026 midscroll - 1.13-1
+- Choose which devices count as a mouse: EXTRA_DEVICES / IGNORE_DEVICES in
+  the config, --extra-device / --ignore-device / --list-devices on the
+  command line, and a device list with a switch each in the settings GUI
+- Draw a ghost cursor that follows your hand while dragging, with the badge
+  locked at the anchor, the way Windows autoscroll looks (GHOST_CURSOR,
+  GHOST_SCALE)
+- Security: the config is only read when root owns it and nobody else can
+  write it; keyboard-class devices are refused unless ALLOW_KEYBOARDS is
+  set by a root edit, which midscroll-apply cannot do; state-socket clients
+  are capped and cursor positions go only to the active session; the daemon
+  now runs with no capabilities; every Apply authenticates. See SECURITY.md
+
 * Mon Jul 20 2026 midscroll - 1.12-1
 - Add an "Enable on desktop & panels" toggle (DESKTOP_SCROLL, off by
   default): while a desktop shell is focused (plasmashell, nemo-desktop,

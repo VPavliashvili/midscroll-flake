@@ -9,10 +9,15 @@
   <action id="io.github.gnhen.midscroll.apply">
     <description>Change midscroll autoscroll settings</description>
     <message>Authentication is required to change midscroll settings</message>
+    <!-- Every Apply asks again. The credential cache auth_admin_keep gives
+         would let anything else in your session re-run midscroll-apply
+         unprompted for five minutes, and this action now decides which
+         input devices the daemon grabs. An inactive session is refused
+         outright; editing /etc/midscroll.conf as root still works. -->
     <defaults>
       <allow_any>auth_admin</allow_any>
-      <allow_inactive>auth_admin</allow_inactive>
-      <allow_active>auth_admin_keep</allow_active>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
     </defaults>
     <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/midscroll-apply</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>

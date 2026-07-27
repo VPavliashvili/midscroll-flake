@@ -9,7 +9,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 repo=$(cd ../.. && pwd)
 
-version=1.12-1
+version=1.13-1
 maintainer=${DEB_MAINTAINER:-"midscroll maintainers <noreply@example.com>"}
 
 work=$(mktemp -d)
@@ -34,6 +34,7 @@ install -Dm644 "$repo/icons/move-vertical.svg" \
     "$stage/usr/share/icons/hicolor/scalable/apps/midscroll.svg"
 install -Dm644 "$repo/midscroll.conf" "$stage/etc/midscroll.conf"
 install -Dm644 "$repo/README.md" "$stage/usr/share/doc/midscroll/README.md"
+install -Dm644 "$repo/SECURITY.md" "$stage/usr/share/doc/midscroll/SECURITY.md"
 install -Dm644 "$repo/LICENSE" "$stage/usr/share/doc/midscroll/copyright"
 
 mkdir -p "$stage/DEBIAN"

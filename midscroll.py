@@ -23,8 +23,15 @@ blacklisted by window class; while one of them is focused, the middle
 button passes straight through. The focused window's class is reported by
 the session helper (midscroll-overlay) over the state socket.
 
+Which devices count as a mouse is decided automatically, and can be
+overridden per device with EXTRA_DEVICES / IGNORE_DEVICES (see
+--list-devices for the identifiers, and SECURITY.md for what forcing a
+device does and does not allow).
+
 Tunables can be overridden in /etc/midscroll.conf (KEY = value lines) or
-per run on the command line: midscroll --help.
+per run on the command line: midscroll --help. The config file decides
+which devices this daemon opens, so it is only read when it is owned by
+root and not writable by anyone else.
 """
 
 import argparse
@@ -32,13 +39,15 @@ import asyncio
 import logging
 import math
 import os
+import re
 import socket
 import struct
+import sys
 import time
 
 from evdev import InputDevice, UInput, ecodes as e, list_devices
 
-VERSION = "1.12"
+VERSION = "1.13"
 
 log = logging.getLogger("midscroll")
 
@@ -57,12 +66,28 @@ TICK_HZ = 90.0            # scroll event rate (higher = smoother)
 NATURAL = False           # True inverts scroll direction
 TOGGLE_MODE = False       # True: click to start/stop instead of hold-and-drag
 DESKTOP_SCROLL = False    # True: also autoscroll over the desktop and panels
+GHOST_CURSOR = True       # True: helper draws a cursor at the dragged point
+GHOST_SCALE = 1.0         # ghost travel per unit of mouse motion
 
 # Window-class substrings (case-insensitive) over which midscroll pauses
 # and the middle button behaves natively.
 BLACKLIST = ["freecad", "orcaslicer", "minecraft"]
 
-# Desktop-environment shells (desktop, panels, taskbars) — autoscroll over
+# Devices to grab even though they aren't detected as a mouse, and devices
+# never to grab even if they are. Entries are device specs (see
+# device_matches): a /dev/input path, "vendor:product" in hex, or a
+# case-insensitive part of the device name.
+EXTRA_DEVICES = []
+IGNORE_DEVICES = []
+
+# Grabbing a keyboard means this root daemon reads every key on it, and it
+# loses key repeat and LEDs on the way through the mirror, so midscroll
+# refuses keyboard-class devices even when a config asks for one. Only a
+# root edit of the config file turns this on: midscroll-apply (the
+# pkexec-reachable writer behind the settings GUI) refuses to set it.
+ALLOW_KEYBOARDS = False
+
+# Desktop-environment shells (desktop, panels, taskbars) - autoscroll over
 # these is almost never wanted (on KDE it switches virtual desktops; panels
 # have nothing to scroll). Blocked exactly like BLACKLIST, but only while
 # DESKTOP_SCROLL is off (the default). Lowercase, to match parse_blacklist.
@@ -71,17 +96,41 @@ DESKTOP_SHELLS = ["plasmashell", "nemo-desktop", "xfdesktop", "waybar",
 
 HIRES_PER_LINE = 120      # kernel convention: 120 hi-res units per notch
 MAX_TICK_DT = 0.25        # cap the per-tick time step (see ticker())
+GHOST_HZ = 60.0           # rate of ghost-cursor updates to the helper
 PHYS_MARKER = "midscroll"  # phys string on our mirrors, so we skip our own
 CONFIG_PATH = "/etc/midscroll.conf"
 SOCK_DIR = "/run/midscroll"
 SOCK_PATH = SOCK_DIR + "/state.sock"
+DEV_DIR = "/dev/input"
+
+# Bounds. The config picks which devices a root daemon opens and the state
+# socket is reachable by every logged-in user, so both are kept small
+# enough that a bad or hostile value costs nothing.
+MAX_CONFIG_BYTES = 65536   # a config bigger than this is ignored
+MAX_SPECS = 32             # device specs per list
+MAX_SPEC_LEN = 128         # characters per device spec
+MIN_NAME_SPEC = 3          # a shorter name fragment would match everything
+MAX_GRABBED = 16           # devices grabbed at once
+MAX_CLIENTS = 16           # state-socket connections
+MAX_CLIENTS_PER_UID = 4
+SOCK_LIMIT = 4096          # per-connection read buffer
+MAX_FOCUS_LEN = 256        # characters kept from a focus report
+WRITE_SKIP_BYTES = 4096    # skip updates for a client this far behind
+WRITE_DROP_BYTES = 65536   # disconnect a client this far behind
 
 FLOAT_KEYS = {"DEADZONE_PX", "TICK_HZ", "SPEED_MULT", "SPEED_EXP",
-              "MAX_PX_PER_SEC", "PX_PER_NOTCH", "MAX_DRAG_PX"}
-BOOL_KEYS = {"NATURAL", "TOGGLE_MODE", "DESKTOP_SCROLL"}
+              "MAX_PX_PER_SEC", "PX_PER_NOTCH", "MAX_DRAG_PX", "GHOST_SCALE"}
+BOOL_KEYS = {"NATURAL", "TOGGLE_MODE", "DESKTOP_SCROLL", "GHOST_CURSOR",
+             "ALLOW_KEYBOARDS"}
+DEVICE_KEYS = {"EXTRA_DEVICES", "IGNORE_DEVICES"}
 # Zero would divide by zero (TICK_HZ, PX_PER_NOTCH) or make the daemon
 # silently never scroll; only the dead zone may be zero.
 POSITIVE_KEYS = FLOAT_KEYS - {"DEADZONE_PX"}
+
+# A device spec written as vendor:product, both hex.
+VID_PID_RE = re.compile(r"^[0-9a-fA-F]{1,4}:[0-9a-fA-F]{1,4}$")
+# Keys a device must have for us to call it a keyboard.
+KEYBOARD_KEYS = (e.KEY_A, e.KEY_Z, e.KEY_SPACE, e.KEY_ENTER)
 
 
 def parse_bool(text):
@@ -103,13 +152,90 @@ def parse_blacklist(text):
     return [p.strip().lower() for p in text.split(",") if p.strip()]
 
 
-def load_config(path=CONFIG_PATH):
+def spec_kind(spec):
+    """Which of the three device-spec forms this is."""
+    if spec.startswith("/"):
+        return "path"
+    if VID_PID_RE.match(spec):
+        return "id"
+    return "name"
+
+
+def parse_devices(text):
+    """Device specs from a comma-separated config value."""
+    return validate_devices(text.split(","))
+
+
+def validate_devices(parts):
+    """The usable device specs out of parts, bounds enforced.
+
+    Rejects what would be dangerous rather than merely wrong: a path
+    outside /dev/input (nothing else can be an input node), and a name
+    fragment so short it would match half the devices on the machine and
+    have us exclusively grab them all.
+    """
+    specs = []
+    for part in parts:
+        spec = part.strip()
+        if not spec:
+            continue
+        if len(specs) >= MAX_SPECS:
+            log.error("config: more than %d device specs; ignoring the rest",
+                      MAX_SPECS)
+            break
+        if len(spec) > MAX_SPEC_LEN:
+            log.error("config: device spec longer than %d characters "
+                      "ignored: %.40s...", MAX_SPEC_LEN, spec)
+            continue
+        kind = spec_kind(spec)
+        if kind == "path" and not spec.startswith(DEV_DIR + "/"):
+            log.error("config: device path %r ignored: must be under %s",
+                      spec, DEV_DIR)
+            continue
+        if kind == "name" and len(spec) < MIN_NAME_SPEC:
+            log.error("config: device name %r ignored: at least %d "
+                      "characters, so it can't match everything",
+                      spec, MIN_NAME_SPEC)
+            continue
+        specs.append(spec)
+    return specs
+
+
+def read_config_text(path):
+    """The config file's text, or None if it is missing or untrustworthy.
+
+    This file decides which devices the daemon opens and grabs, so it is
+    only honoured when root owns it and nobody else can write it. The
+    check is done with fstat on the open descriptor (and O_NOFOLLOW on the
+    way in), so there is no window between checking and reading.
+    """
     try:
-        with open(path) as f:
-            lines = f.read().splitlines()
-    except OSError:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None
+    except OSError as err:
+        log.error("config: cannot read %s: %s", path, err)
+        return None
+    with os.fdopen(fd, "rb") as f:
+        st = os.fstat(f.fileno())
+        if st.st_uid != 0 or st.st_mode & 0o022:
+            log.error("config: ignoring %s: it must be owned by root and not "
+                      "writable by group or others (uid %d, mode %04o)",
+                      path, st.st_uid, st.st_mode & 0o7777)
+            return None
+        data = f.read(MAX_CONFIG_BYTES + 1)
+    if len(data) > MAX_CONFIG_BYTES:
+        log.error("config: ignoring %s: larger than %d bytes",
+                  path, MAX_CONFIG_BYTES)
+        return None
+    return data.decode("utf-8", "replace")
+
+
+def load_config(path=CONFIG_PATH):
+    text = read_config_text(path)
+    if text is None:
         return
-    for line in lines:
+    for line in text.splitlines():
         line = line.split("#", 1)[0].strip()
         if "=" not in line:
             continue
@@ -131,6 +257,8 @@ def load_config(path=CONFIG_PATH):
             globals()[k] = parse_bool(v)
         elif k == "BLACKLIST":
             globals()["BLACKLIST"] = parse_blacklist(v)
+        elif k in DEVICE_KEYS:
+            globals()[k] = parse_devices(v)
         else:
             log.warning("config: unknown key %s", k)
 
@@ -148,23 +276,40 @@ def _peer_uid(sock):
         return None
 
 
-def _uid_has_active_seat(uid):
-    """True if uid is a user logged in on a seat (not a service account).
+def _uid_state(uid):
+    """logind's STATE for a uid ("active", "online", ...), or "".
 
     logind writes /run/systemd/users/<uid> with a STATE line for each
-    logged-in user. We only trust focus reports from such a user, so a
-    random local process (sandboxed app, service account) can't feed the
-    daemon and pause it. Without logind nobody is trusted and the app
-    blacklist is simply inactive.
+    logged-in user. Without logind every uid comes back as "" and is
+    trusted with nothing.
     """
     try:
         with open(f"/run/systemd/users/{uid}") as f:
             for line in f:
                 if line.startswith("STATE="):
-                    return line.strip()[len("STATE="):] in ("active", "online")
+                    return line.strip()[len("STATE="):]
     except OSError:
         pass
-    return False
+    return ""
+
+
+def _uid_has_seat(uid):
+    """True if uid is a user logged in on a seat (not a service account).
+
+    We only trust focus reports from such a user, so a random local
+    process (sandboxed app, service account) can't feed the daemon and
+    pause it.
+    """
+    return _uid_state(uid) in ("active", "online")
+
+
+def _uid_is_active(uid):
+    """True if uid owns the session currently in front of the screen.
+
+    Stricter than _uid_has_seat: cursor motion goes only to the session
+    that is actually being used, never to another user's backgrounded one.
+    """
+    return _uid_state(uid) == "active"
 
 
 class FocusFilter:
@@ -181,8 +326,11 @@ class FocusFilter:
         self.by_client = {}
 
     def update(self, client, wclass):
-        self.by_client[client] = wclass
-        log.debug("focus: %r (blocked=%s)", wclass, self.blocked)
+        # Bounded and stripped of control characters: this string comes
+        # off a socket and ends up in the journal.
+        clean = "".join(c for c in wclass if c.isprintable())[:MAX_FOCUS_LEN]
+        self.by_client[client] = clean
+        log.debug("focus: %r (blocked=%s)", clean, self.blocked)
 
     def remove(self, client):
         self.by_client.pop(client, None)
@@ -201,19 +349,28 @@ class Notifier:
     """State socket shared with session helpers (midscroll-overlay).
 
     Sends b"1\\n" when a drag-scroll starts and b"0\\n" when it stops (and
-    the current state on connect) so the helper can draw the badge; reads
-    "focus <window class>" lines back to drive the blacklist. Only helpers
-    running as a logged-in user are accepted (see _uid_has_active_seat);
-    everything else is dropped, so a stray local process can't pause the
-    daemon. Purely advisory otherwise: scrolling works with no listeners,
-    and failing to bind the socket is non-fatal.
+    the current state on connect) so the helper can draw the badge, plus
+    "pos <dx> <dy>" lines while an anchored drag is running so it can draw
+    the ghost cursor; reads "focus <window class>" lines back to drive the
+    blacklist.
+
+    Security notes, because this socket is reachable by every logged-in
+    user: only helpers running as a user logged in on a seat are accepted
+    (_uid_has_seat), the number of connections is capped overall and per
+    uid, lines in are length-bounded, and the "pos" stream - the only
+    thing here that says anything about what the user is doing - goes only
+    to the session that is currently active. Positions are offsets from
+    the anchor, never absolute coordinates. Purely advisory otherwise:
+    scrolling works with no listeners, and failing to bind is non-fatal.
     """
 
     def __init__(self, focus):
         self.focus = focus
-        self.writers = set()
+        self.writers = {}       # writer -> peer uid
         self.msg = b"0\n"
         self.server = None
+        self.last_pos = None
+        self.active_uids = frozenset()
 
     async def start(self):
         try:
@@ -222,22 +379,39 @@ class Notifier:
                 os.unlink(SOCK_PATH)
             except FileNotFoundError:
                 pass
+            # limit= bounds what one peer can make us buffer per line.
             self.server = await asyncio.start_unix_server(
-                self._client, SOCK_PATH)
+                self._client, SOCK_PATH, limit=SOCK_LIMIT)
             # World-accessible so any session's helper can connect; each
             # connection is then checked by peer UID before we trust it.
+            # The directory above is root-only (RuntimeDirectory=), so
+            # nobody else can create or replace this socket.
             os.chmod(SOCK_PATH, 0o666)
         except OSError as err:
             log.warning("overlay socket unavailable: %s", err)
 
+    def _too_many(self, uid):
+        if len(self.writers) >= MAX_CLIENTS:
+            return True
+        same = sum(1 for u in self.writers.values() if u == uid)
+        return same >= MAX_CLIENTS_PER_UID
+
     async def _client(self, reader, writer):
         uid = _peer_uid(writer.get_extra_info("socket"))
-        if uid is None or not _uid_has_active_seat(uid):
+        if uid is None or not _uid_has_seat(uid):
             log.debug("rejected socket from uid %s", uid)
             writer.close()
             return
+        if self._too_many(uid):
+            # Every connection costs a broadcast slot at GHOST_HZ, so a
+            # user can't open thousands and make us spin.
+            log.warning("too many state-socket clients; refusing uid %s", uid)
+            writer.close()
+            return
         client = object()  # identity key for this connection's focus report
-        self.writers.add(writer)
+        self.writers[writer] = uid
+        if _uid_is_active(uid):
+            self.active_uids |= {uid}
         try:
             writer.write(self.msg)
             while True:
@@ -248,22 +422,59 @@ class Notifier:
                 if text.startswith("focus "):
                     self.focus.update(client, text[len("focus "):])
         except (OSError, ConnectionError, ValueError):
-            pass
+            pass  # ValueError: line over SOCK_LIMIT, drop the peer
         finally:
-            self.writers.discard(writer)
+            self.writers.pop(writer, None)
             self.focus.remove(client)
             writer.close()
+
+    def _drop(self, writer):
+        self.writers.pop(writer, None)
+        try:
+            writer.close()
+        except (OSError, ConnectionError):
+            pass
+
+    def _broadcast(self, msg, active_only=False):
+        for w, uid in list(self.writers.items()):
+            if active_only and uid not in self.active_uids:
+                continue
+            try:
+                # A helper that stops reading must not grow our memory:
+                # skip it while it is behind, drop it if it stays behind.
+                pending = w.transport.get_write_buffer_size()
+                if pending > WRITE_DROP_BYTES:
+                    log.warning("dropping a state-socket client that is "
+                                "not reading (uid %s)", uid)
+                    self._drop(w)
+                    continue
+                if pending > WRITE_SKIP_BYTES:
+                    continue
+                w.write(msg)
+            except (OSError, ConnectionError, AttributeError):
+                self._drop(w)
 
     def set(self, active):
         msg = b"1\n" if active else b"0\n"
         if msg == self.msg:
             return
         self.msg = msg
-        for w in list(self.writers):
-            try:
-                w.write(msg)
-            except (OSError, ConnectionError):
-                self.writers.discard(w)
+        self.last_pos = None  # each drag re-sends its position
+        if active:
+            # Re-checked per drag: sessions switch while we run.
+            self.active_uids = frozenset(
+                u for u in set(self.writers.values()) if _uid_is_active(u))
+        self._broadcast(msg)
+
+    def pos(self, dx, dy):
+        """Offset of the ghost cursor from the anchor, in screen pixels."""
+        if self.msg != b"1\n":
+            return
+        p = (int(dx), int(dy))
+        if p == self.last_pos:
+            return
+        self.last_pos = p
+        self._broadcast(b"pos %d %d\n" % p, active_only=True)
 
 
 class State:
@@ -349,6 +560,7 @@ async def ticker(states, notifier, focus):
     # under load asyncio.sleep overshoots, and using the nominal step
     # would quietly make scrolling slower than configured.
     last = time.monotonic()
+    last_ghost = last
     while True:
         await asyncio.sleep(1.0 / TICK_HZ)
         now = time.monotonic()
@@ -360,6 +572,14 @@ async def ticker(states, notifier, focus):
             except Exception as err:  # one bad tick must not kill the loop
                 log.error("tick error: %r", err)
         notifier.set(any(st.scrolling for st in states.values()))
+        if GHOST_CURSOR and now - last_ghost >= 1.0 / GHOST_HZ:
+            last_ghost = now
+            # Only an anchored drag has a ghost: in toggle mode the real
+            # cursor moves, so there is nothing to stand in for it.
+            dragging = next((s for s in states.values() if s.active), None)
+            if dragging is not None:
+                notifier.pos(dragging.dx * GHOST_SCALE,
+                             dragging.dy * GHOST_SCALE)
 
 
 def tick(st, dt, focus):
@@ -665,6 +885,127 @@ def is_mouse(dev):
             and e.ABS_MT_POSITION_X not in abs_codes)
 
 
+def is_keyboard(dev):
+    """True for anything you could type on.
+
+    Deliberately broad: if a device can produce letters, midscroll stays
+    away from it unless ALLOW_KEYBOARDS says otherwise, so no config can
+    quietly point a root daemon at your typing.
+    """
+    keys = set(dev.capabilities().get(e.EV_KEY, ()))
+    return all(k in keys for k in KEYBOARD_KEYS)
+
+
+def device_matches(dev, path, spec):
+    """True if one device spec names this device.
+
+    Three forms: a /dev/input path (including the stable by-id and by-path
+    symlinks), "vendor:product" in hex, or a case-insensitive part of the
+    device name. The spec is never opened - it is only ever compared
+    against nodes the daemon has already enumerated and opened itself - so
+    a spec cannot steer us into opening a path of its choosing, and there
+    is no check-then-open race.
+    """
+    kind = spec_kind(spec)
+    if kind == "path":
+        return os.path.realpath(spec) == path
+    if kind == "id":
+        vendor, product = spec.split(":")
+        return (dev.info.vendor == int(vendor, 16)
+                and dev.info.product == int(product, 16))
+    return spec.lower() in (dev.name or "").strip().lower()
+
+
+def decide_device(dev, path):
+    """(grab?, reason) for one device. The one place that decides.
+
+    Order matters: our own mirrors and keyboards are refused before the
+    config lists are consulted, so no spec can reach either.
+    """
+    if PHYS_MARKER in (dev.phys or ""):
+        return False, "midscroll's own mirror"
+    if is_keyboard(dev) and not ALLOW_KEYBOARDS:
+        return False, ("keyboard-class device; set ALLOW_KEYBOARDS in "
+                       f"{CONFIG_PATH} to allow it")
+    ignored = next((s for s in IGNORE_DEVICES
+                    if device_matches(dev, path, s)), None)
+    forced = next((s for s in EXTRA_DEVICES
+                   if device_matches(dev, path, s)), None)
+    if ignored is not None:
+        return False, f"ignored by {ignored!r}"
+    if forced is not None:
+        return True, f"forced by {forced!r}"
+    if is_mouse(dev):
+        return True, "detected as a mouse"
+    return False, "not a mouse"
+
+
+def want_device(dev, path, our_paths):
+    """Whether to grab a device, logging every decision worth knowing."""
+    if path in our_paths:
+        return False  # one of our own mirrors, before its phys is known
+    grab, reason = decide_device(dev, path)
+    name = (dev.name or "").strip()
+    if grab:
+        if reason != "detected as a mouse":
+            log.info("using %s (%s): %s", name, path, reason)
+    elif any(device_matches(dev, path, s) for s in EXTRA_DEVICES):
+        # Asked for by the config but refused: always say why.
+        log.warning("refusing %s (%s): %s", name, path, reason)
+    else:
+        log.debug("ignoring %s (%s): %s", name, path, reason)
+    return grab
+
+
+def stable_specs():
+    """Map each /dev/input/eventN to its most stable identifier.
+
+    The by-id and by-path symlinks survive reboots and renumbering, which
+    plain eventN does not, so they are what --list-devices recommends and
+    what the settings GUI writes.
+    """
+    specs = {}
+    for directory in (DEV_DIR + "/by-path", DEV_DIR + "/by-id"):
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            continue
+        for name in sorted(names):
+            link = os.path.join(directory, name)
+            target = os.path.realpath(link)
+            if target.startswith(DEV_DIR + "/event"):
+                specs[target] = link  # by-id listed last, so it wins
+    return specs
+
+
+def report_devices():
+    """Print every input device, its identifier and what midscroll does."""
+    if os.geteuid() != 0:
+        print("note: run this as root to see every device\n",
+              file=sys.stderr)
+    specs = stable_specs()
+
+    def event_num(path):
+        digits = "".join(c for c in os.path.basename(path) if c.isdigit())
+        return int(digits) if digits else 0
+
+    for path in sorted(list_devices(), key=event_num):
+        try:
+            dev = InputDevice(path)
+        except OSError as err:
+            print(f"{path}\n    cannot open: {err}\n")
+            continue
+        try:
+            info = dev.info
+            grab, reason = decide_device(dev, path)
+            print(f"{path}  {info.vendor:04x}:{info.product:04x}  "
+                  f"{(dev.name or '').strip()}")
+            print(f"    spec: {specs.get(path, path)}")
+            print(f"    {'used' if grab else 'not used'}: {reason}\n")
+        finally:
+            dev.close()
+
+
 async def main():
     focus = FocusFilter()
     notifier = Notifier(focus)
@@ -694,12 +1035,19 @@ async def main():
                     dev = InputDevice(path)
                 except OSError:
                     continue
-                if is_mouse(dev):
-                    tasks[path] = asyncio.create_task(
-                        pump(path, dev, states, tasks, focus, our_paths))
-                else:
-                    log.debug("ignoring %s (%s)", dev.name, path)
+                if not want_device(dev, path, our_paths):
                     dev.close()
+                    continue
+                if len(tasks) >= MAX_GRABBED:
+                    # A bad config (or a very odd machine) must not have us
+                    # exclusively grab the whole input stack. Replug a
+                    # device to have it reconsidered.
+                    log.warning("already grabbing %d devices; skipping %s",
+                                MAX_GRABBED, path)
+                    dev.close()
+                    continue
+                tasks[path] = asyncio.create_task(
+                    pump(path, dev, states, tasks, focus, our_paths))
             await asyncio.sleep(2)
     finally:
         tick_task.cancel()
@@ -730,6 +1078,8 @@ CLI_FLOATS = {
                        "pixels one wheel notch scrolls in your apps"),
     "--max-drag-px": ("MAX_DRAG_PX", "cap on effective drag distance"),
     "--tick-hz": ("TICK_HZ", "scroll event rate"),
+    "--ghost-scale": ("GHOST_SCALE",
+                      "ghost-cursor travel per unit of mouse motion"),
 }
 
 
@@ -756,10 +1106,28 @@ def parse_args(argv=None):
                    default=None, dest="desktop_scroll",
                    help="also autoscroll over the desktop and panels "
                         "(default: off, so they are left alone)")
+    p.add_argument("--ghost-cursor", action=argparse.BooleanOptionalAction,
+                   default=None, dest="ghost_cursor",
+                   help="tell the session helper where to draw a ghost "
+                        "cursor while dragging (default: on)")
     p.add_argument("--blacklist", metavar="APPS", default=None,
                    help="comma-separated window-class substrings over which "
                         "midscroll pauses (default: "
                         f"\"{', '.join(BLACKLIST)}\"; pass '' to disable)")
+    p.add_argument("--extra-device", metavar="SPEC", action="append",
+                   default=None, dest="extra_devices",
+                   help="grab this device even if it isn't detected as a "
+                        "mouse; a /dev/input path, hex vendor:product, or "
+                        "part of the device name. Repeatable; replaces the "
+                        "configured list. See --list-devices")
+    p.add_argument("--ignore-device", metavar="SPEC", action="append",
+                   default=None, dest="ignore_devices",
+                   help="never grab this device, in the same forms as "
+                        "--extra-device. Repeatable; replaces the "
+                        "configured list")
+    p.add_argument("--list-devices", action="store_true",
+                   help="list every input device with its identifier and "
+                        "what midscroll would do with it, then exit")
     for flag, (key, help_text) in CLI_FLOATS.items():
         p.add_argument(flag, dest=key.lower(), type=_float_arg(key),
                        default=None, metavar="N",
@@ -783,12 +1151,23 @@ def cli():
         globals()["TOGGLE_MODE"] = args.toggle_mode
     if args.desktop_scroll is not None:
         globals()["DESKTOP_SCROLL"] = args.desktop_scroll
+    if args.ghost_cursor is not None:
+        globals()["GHOST_CURSOR"] = args.ghost_cursor
     if args.blacklist is not None:
         globals()["BLACKLIST"] = parse_blacklist(args.blacklist)
+    for key, specs in (("EXTRA_DEVICES", args.extra_devices),
+                       ("IGNORE_DEVICES", args.ignore_devices)):
+        if specs is not None:
+            globals()[key] = validate_devices(specs)
+    if args.list_devices:
+        report_devices()
+        return
     log.debug("tunables: %s NATURAL=%s TOGGLE_MODE=%s DESKTOP_SCROLL=%s "
-              "BLACKLIST=%s",
+              "GHOST_CURSOR=%s ALLOW_KEYBOARDS=%s BLACKLIST=%s "
+              "EXTRA_DEVICES=%s IGNORE_DEVICES=%s",
               " ".join(f"{k}={globals()[k]:g}" for k in sorted(FLOAT_KEYS)),
-              NATURAL, TOGGLE_MODE, DESKTOP_SCROLL, BLACKLIST)
+              NATURAL, TOGGLE_MODE, DESKTOP_SCROLL, GHOST_CURSOR,
+              ALLOW_KEYBOARDS, BLACKLIST, EXTRA_DEVICES, IGNORE_DEVICES)
     asyncio.run(main())
 
 

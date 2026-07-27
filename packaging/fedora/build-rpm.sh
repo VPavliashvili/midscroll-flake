@@ -12,7 +12,7 @@ cp "$repo"/midscroll.py "$repo"/midscroll-overlay.py "$repo"/midscroll.conf \
    "$repo"/midscroll-settings.py "$repo"/midscroll-apply.py \
    "$repo"/io.github.gnhen.midscroll.Settings.desktop \
    "$repo"/io.github.gnhen.midscroll.policy \
-   "$repo"/README.md "$repo"/LICENSE \
+   "$repo"/README.md "$repo"/SECURITY.md "$repo"/LICENSE \
    "$repo"/systemd/midscroll.service "$repo"/systemd/midscroll-overlay.service \
    "$repo"/icons/move-vertical.svg "$work"/
 
