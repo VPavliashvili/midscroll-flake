@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.gnhen.midscroll.Settings</id>
+
+  <name>midscroll</name>
+  <summary>Windows-style middle-button drag autoscroll</summary>
+
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>Unlicense</project_license>
+
+  <developer id="io.github.gnhen">
+    <name>gnhen</name>
+  </developer>
+
+  <description>
+    <p>
+      Hold the middle mouse button and drag. The page scrolls in that
+      direction, faster the farther you drag from where you pressed, like
+      Windows 10 and 11. Release to stop. A quick middle click without
+      dragging still works as a normal middle click, so paste and
+      open-link-in-new-tab are unaffected. Diagonal drags scroll both axes,
+      so wide pages pan too.
+    </p>
+    <p>
+      It works in every application, on both Wayland and X11, because it
+      operates at the kernel input layer rather than hooking any particular
+      desktop or toolkit.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>The speed curve is the same formula Chromium and Edge use for
+      Windows autoscroll, so short drags crawl and long drags fly.</li>
+      <li>The cursor stays anchored at the press point while scrolling, so
+      the scroll stays locked to the window you started in.</li>
+      <li>A toggle mode for the Windows Explorer and Firefox style: one
+      click starts autoscroll, any click stops it.</li>
+      <li>An app blacklist that pauses midscroll over programs with their
+      own middle-drag, such as FreeCAD, OrcaSlicer and Minecraft.</li>
+      <li>A settings window for speed, dead zone, event rate, natural
+      scrolling and the blacklist.</li>
+    </ul>
+    <p>
+      This package installs a background daemon that reads mouse input
+      devices and writes to a virtual input device. The source is small and
+      commented, and both systemd units are sandboxed, so the code can be
+      reviewed before you trust it.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.gnhen.midscroll.Settings.desktop</launchable>
+
+  <provides>
+    <binary>midscroll</binary>
+    <binary>midscroll-settings</binary>
+  </provides>
+
+  <url type="homepage">https://github.com/gnhen/midscroll</url>
+  <url type="bugtracker">https://github.com/gnhen/midscroll/issues</url>
+  <url type="vcs-browser">https://github.com/gnhen/midscroll</url>
+
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/gnhen/midscroll/main/screenshots/settings.png</image>
+      <caption>Adjusting the scroll speed and behavior</caption>
+    </screenshot>
+  </screenshots>
+
+  <categories>
+    <category>Settings</category>
+    <category>HardwareSettings</category>
+  </categories>
+
+  <keywords>
+    <keyword>mouse</keyword>
+    <keyword>scroll</keyword>
+    <keyword>autoscroll</keyword>
+    <keyword>middle click</keyword>
+    <keyword>wheel</keyword>
+  </keywords>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="1.14" date="2026-07-28">
+      <description>
+        <p>
+          Adds a proper software-center listing, so midscroll can be found,
+          installed and updated from Discover and GNOME Software.
+        </p>
+      </description>
+    </release>
+    <release version="1.13" date="2026-07-27">
+      <description>
+        <p>
+          Adds a device list so you can choose exactly which devices count
+          as a mouse, draws a ghost cursor that follows your hand while the
+          badge stays anchored, and tightens how the daemon reads its config
+          and hands out cursor positions.
+        </p>
+      </description>
+    </release>
+    <release version="1.12" date="2026-07-20">
+      <description>
+        <p>
+          Adds an option to enable autoscroll over the desktop and panels,
+          off by default so a middle-drag no longer hijacks the desktop.
+        </p>
+      </description>
+    </release>
+  </releases>
+</component>

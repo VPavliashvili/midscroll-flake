@@ -1,5 +1,5 @@
 Name:           midscroll
-Version:        1.13
+Version:        1.14
 Release:        1%{?dist}
 Summary:        Windows-style middle-button drag autoscroll
 License:        Unlicense
@@ -18,6 +18,7 @@ Source9:        midscroll-apply.py
 Source10:       io.github.gnhen.midscroll.Settings.desktop
 Source11:       io.github.gnhen.midscroll.policy
 Source12:       SECURITY.md
+Source13:       io.github.gnhen.midscroll.Settings.metainfo.xml
 
 Requires:       python3
 Requires:       python3-evdev
@@ -34,6 +35,9 @@ Requires:       polkit
 Recommends:     xprop
 %{?systemd_requires}
 BuildRequires:  systemd-rpm-macros
+# Validating the software-center metadata (%%check)
+BuildRequires:  libappstream-glib
+BuildRequires:  desktop-file-utils
 
 %description
 Hold the middle mouse button and drag to scroll, with speed proportional
@@ -63,9 +67,18 @@ install -Dm644 %{SOURCE10} \
     %{buildroot}%{_datadir}/applications/io.github.gnhen.midscroll.Settings.desktop
 install -Dm644 %{SOURCE11} \
     %{buildroot}%{_datadir}/polkit-1/actions/io.github.gnhen.midscroll.policy
+# Software-center metadata, so the settings app shows up in Discover/GNOME Software
+install -Dm644 %{SOURCE13} \
+    %{buildroot}%{_metainfodir}/io.github.gnhen.midscroll.Settings.metainfo.xml
 install -d %{buildroot}%{_userpresetdir}
 echo "enable midscroll-overlay.service" \
     > %{buildroot}%{_userpresetdir}/90-midscroll.preset
+
+%check
+appstream-util validate-relax --nonet \
+    %{buildroot}%{_metainfodir}/io.github.gnhen.midscroll.Settings.metainfo.xml
+desktop-file-validate \
+    %{buildroot}%{_datadir}/applications/io.github.gnhen.midscroll.Settings.desktop
 
 %post
 %systemd_post midscroll.service
@@ -98,9 +111,15 @@ fi
 %{_datadir}/icons/hicolor/scalable/apps/midscroll.svg
 %{_datadir}/applications/io.github.gnhen.midscroll.Settings.desktop
 %{_datadir}/polkit-1/actions/io.github.gnhen.midscroll.policy
+%{_metainfodir}/io.github.gnhen.midscroll.Settings.metainfo.xml
 %config(noreplace) %{_sysconfdir}/midscroll.conf
 
 %changelog
+* Tue Jul 28 2026 midscroll - 1.14-1
+- Ship AppStream metadata, so the settings app has a proper listing in
+  Discover and GNOME Software instead of appearing as a bare package
+- Validate the metadata and the desktop entry as part of the build
+
 * Mon Jul 27 2026 midscroll - 1.13-1
 - Choose which devices count as a mouse: EXTRA_DEVICES / IGNORE_DEVICES in
   the config, --extra-device / --ignore-device / --list-devices on the
