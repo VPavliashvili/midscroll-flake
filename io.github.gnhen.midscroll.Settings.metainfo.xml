@@ -60,8 +60,8 @@
 
   <screenshots>
     <screenshot type="default">
-      <image>https://raw.githubusercontent.com/gnhen/midscroll/main/screenshots/settings.png</image>
-      <caption>Adjusting the scroll speed and behavior</caption>
+      <image width="1248" height="702">https://raw.githubusercontent.com/gnhen/midscroll/main/screenshots/logo.png</image>
+      <caption>The midscroll logo</caption>
     </screenshot>
   </screenshots>
 
